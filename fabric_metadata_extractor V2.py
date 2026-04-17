@@ -645,26 +645,62 @@ def extract_datasources(
         items_by_ws.setdefault(item["workspace_id"], []).append(item)
 
     # ── [A] Semantic Model datasources ────────────────────────────────────────
+    # NOTE: The getDatasources REST API requires the caller to be the dataset
+    # *owner*.  Workspace Members / Contributors who did not publish the model
+    # will receive HTTP 403.  These are logged to meta_access_errors and skipped.
+    # Connection info for inaccessible models can be found in the M expressions
+    # stored in meta_power_queries (query_expression column).
+    #
+    # We also skip:
+    #   • Direct Lake models (targetStorageMode = "ABF") — no traditional datasource
+    #   • Non-refreshable models — auto-generated defaults with no user-defined source
     print("  [A] Semantic Model datasources...")
-    model_by_ws: Dict[str, List[str]] = {}
-    for m in model_rows:
-        model_by_ws.setdefault(m["workspace_id"], []).append(m["model_id"])
+    ds_tried = ds_ok = ds_skipped_preflight = 0
+
+    # Build a richer lookup: model_id → full model row (for skip checks)
+    model_row_map = {m["model_id"]: m for m in model_rows}
 
     for ws_id in workspace_ids:
-        for model_id in model_by_ws.get(ws_id, []):
+        for m in model_rows:
+            if m["workspace_id"] != ws_id:
+                continue
+
+            model_id   = m["model_id"]
+            model_name = m.get("model_name", "")
+            storage    = (m.get("target_storage_mode") or "").upper()
+            refreshable = m.get("is_refreshable", True)
+
+            # Pre-flight skips (no API call needed — these always fail)
+            if storage == "ABF":
+                ds_skipped_preflight += 1
+                continue   # Direct Lake — reads Delta directly, no datasource record
+            if not refreshable:
+                ds_skipped_preflight += 1
+                continue   # Auto-generated default model
+
+            ds_tried += 1
             data = api_get(
                 f"{PBI_API_BASE}/groups/{ws_id}/datasets/{model_id}/datasources",
                 pbi_hdr,
                 workspace_id=ws_id, item_id=model_id,
                 item_type="SemanticModel",
-                item_name=model_name_map.get(model_id, ""),
+                item_name=model_name,
                 operation="GetSemanticModelDatasources"
             )
-            for ds in (data or {}).get("value", []):
-                rows.append(_build_datasource_row(
-                    ds, model_id, "SemanticModel",
-                    model_name_map.get(model_id, ""), ws_id
-                ))
+            if data is not None:
+                ds_ok += 1
+                for ds in data.get("value", []):
+                    rows.append(_build_datasource_row(
+                        ds, model_id, "SemanticModel", model_name, ws_id
+                    ))
+            # 403 / other errors → already logged to meta_access_errors by api_get
+
+    ds_failed = ds_tried - ds_ok
+    print(
+        f"    → {ds_ok}/{ds_tried} models returned datasources  "
+        f"| {ds_skipped_preflight} pre-flight skipped (Direct Lake / non-refreshable)"
+        + (f"  | {ds_failed} failed (403 = not dataset owner — see meta_access_errors)" if ds_failed else "")
+    )
 
     # ── [B] Dataflow Gen1 datasources ─────────────────────────────────────────
     print("  [B] Dataflow Gen1 datasources...")
@@ -998,6 +1034,30 @@ _STORAGE_MODE_MAP = {
 }
 
 
+def _strip_dax_col(key: str) -> str:
+    """
+    Normalises a DAX result column name to a plain field name.
+
+    The executeQueries API can return column names in two formats:
+      • "[ColumnName]"             →  "ColumnName"        (simple)
+      • "[TableName].[ColumnName]" →  "ColumnName"        (qualified)
+
+    Using str.strip("[]") only handles the simple format; for qualified names
+    like "[Partition].[QueryDefinition]" it would produce the broken string
+    "Partition].[QueryDefinition".  This helper handles both cases correctly.
+    """
+    # Remove outer brackets if present, then split on "].[" and take the last segment
+    clean = key.strip()
+    if clean.startswith("["):
+        clean = clean[1:]
+    if clean.endswith("]"):
+        clean = clean[:-1]
+    # "[Table].[Column]" after outer-bracket removal → "Table].[Column"
+    # Split on the inner "].[" separator and take the rightmost part
+    parts = clean.split("].[")
+    return parts[-1]
+
+
 def _execute_dax(
     ws_id:    str,
     model_id: str,
@@ -1008,9 +1068,8 @@ def _execute_dax(
     Executes a DAX query against a semantic model via the executeQueries endpoint.
     Returns the list of row dicts from the first result table, or None on error.
 
-    The Power BI executeQueries API returns column names with bracket notation,
-    e.g.  "[TableID]", "[Name]", "[QueryDefinition]".
-    This function strips the brackets so callers can use plain key names.
+    Column name normalisation is handled by _strip_dax_col() which handles both
+    simple "[ColumnName]" and qualified "[TableName].[ColumnName]" formats.
     """
     headers = {**pbi_headers(), "Content-Type": "application/json"}
     body    = {
@@ -1023,7 +1082,7 @@ def _execute_dax(
             f"{PBI_API_BASE}/groups/{ws_id}/datasets/{model_id}/executeQueries",
             headers=headers,
             json=body,
-            timeout=120
+            timeout=180
         )
     except Exception as ex:
         _log_access_error(
@@ -1038,17 +1097,25 @@ def _execute_dax(
         try:
             results = resp.json().get("results", [])
             raw_rows = results[0]["tables"][0].get("rows", []) if results else []
-            # Strip bracket notation from column names: "[Name]" → "Name"
+            # Normalise column names: "[Name]" or "[Table].[Name]" → "Name"
             return [
-                {k.strip("[]"): v for k, v in row.items()}
+                {_strip_dax_col(k): v for k, v in row.items()}
                 for row in raw_rows
             ]
         except (IndexError, KeyError):
             return []   # Query returned no rows — not an error
 
-    elif resp.status_code in (400,):
-        # DAX INFO functions not supported on this dataset type (e.g. push-only)
-        # Log quietly — not a permissions issue
+    elif resp.status_code == 400:
+        # 400 means the dataset rejected the DAX query.
+        # Most common causes (in a Fabric workspace):
+        #   • The executeQueries endpoint is unavailable for this dataset type
+        #     (push/streaming, or a model that hasn't been loaded yet)
+        #   • INFO.TABLES() / INFO.PARTITIONS() require XMLA Read access to be
+        #     enabled on the capacity — ask your Fabric capacity admin to enable
+        #     "XMLA Endpoint → Read Only" (or Read/Write) for this capacity.
+        #   • The dataset is in a non-Premium/non-Fabric capacity.
+        error_preview = resp.text[:500] if resp.text else "(empty body)"
+        print(f"  [WARN] HTTP 400 — model '{model_name}': {error_preview}")
         _log_access_error(
             workspace_id=ws_id, item_id=model_id,
             item_type="SemanticModel", item_name=model_name,
@@ -1070,6 +1137,8 @@ def _execute_dax(
         return None
 
     else:
+        error_preview = resp.text[:500] if resp.text else "(empty body)"
+        print(f"  [WARN] HTTP {resp.status_code} — model '{model_name}': {error_preview}")
         _log_access_error(
             workspace_id=ws_id, item_id=model_id,
             item_type="SemanticModel", item_name=model_name,
@@ -1104,20 +1173,97 @@ def extract_power_queries(model_rows: List[Dict]) -> List[Dict]:
     rows: List[Dict] = []
     skipped = 0
 
+    # ── Explicit SELECTCOLUMNS queries ────────────────────────────────────────
+    # Using SELECTCOLUMNS(INFO.x(), ...) with named columns is more reliable
+    # than bare EVALUATE INFO.x() because:
+    #   1. It avoids sending dozens of unused columns (smaller payload)
+    #   2. Some Fabric models accept SELECTCOLUMNS where bare INFO calls return 400
+    #   3. Column names in the result are exactly what we specify — no bracket
+    #      stripping edge cases.
+    _DAX_TABLES = (
+        "EVALUATE "
+        "SELECTCOLUMNS(INFO.TABLES(), "
+        '  "TableID",  [ID], '
+        '  "Name",     [Name])'
+    )
+    _DAX_PARTS = (
+        "EVALUATE "
+        "SELECTCOLUMNS(INFO.PARTITIONS(), "
+        '  "TableID",         [TableID], '
+        '  "Name",            [Name], '
+        '  "Type",            [Type], '
+        '  "Mode",            [Mode], '
+        '  "QueryDefinition", [QueryDefinition])'
+    )
+
+    # ── Diagnostic probe ─────────────────────────────────────────────────────
+    # Before processing every model, verify the executeQueries endpoint works
+    # at all by running a trivial query against the first viable model.
+    # If this returns 400 it almost always means either:
+    #   (a) XMLA Read is disabled on the capacity  →  ask Fabric admin to enable
+    #       "XMLA Endpoint" (Read Only) in Fabric Admin Portal > Capacities.
+    #   (b) No model in this workspace supports executeQueries (all are Direct Lake
+    #       or auto-generated) — in that case extraction is simply not possible.
+    viable = [
+        m for m in model_rows
+        if (m.get("target_storage_mode") or "").upper() != "ABF"
+        and m.get("is_refreshable", True)
+    ]
+    if not viable:
+        print("  [INFO] No viable models found after pre-flight filter — "
+              "all are Direct Lake or non-refreshable. Skipping Power Query extraction.")
+        return []
+
+    probe_model = viable[0]
+    print(f"  [PROBE] Testing executeQueries on '{probe_model.get('model_name', '')}' ...")
+    probe_result = _execute_dax(
+        probe_model["workspace_id"],
+        probe_model["model_id"],
+        "EVALUATE ROW(\"OK\", 1)",
+        probe_model.get("model_name", "")
+    )
+    if probe_result is None:
+        print(
+            "\n  ╔══════════════════════════════════════════════════════════╗\n"
+            "  ║  Power Query extraction BLOCKED — executeQueries failed  ║\n"
+            "  ╠══════════════════════════════════════════════════════════╣\n"
+            "  ║  Most likely cause: XMLA Endpoint is disabled on this    ║\n"
+            "  ║  Fabric capacity.                                         ║\n"
+            "  ║                                                           ║\n"
+            "  ║  Fix: Fabric Admin Portal → Capacities → [your capacity] ║\n"
+            "  ║       → Workloads → XMLA Endpoint → set to Read Only     ║\n"
+            "  ║       (or Read/Write).                                    ║\n"
+            "  ║                                                           ║\n"
+            "  ║  Until enabled, meta_power_queries will be empty.        ║\n"
+            "  ╚══════════════════════════════════════════════════════════╝\n"
+        )
+        return []
+    print("  [PROBE] executeQueries endpoint OK — proceeding with INFO queries...")
+
     for m in model_rows:
         ws_id      = m["workspace_id"]
         model_id   = m["model_id"]
         model_name = m.get("model_name", "")
 
+        # ── Pre-flight: skip model types that cannot serve DAX INFO queries ────
+        storage_mode_raw = (m.get("target_storage_mode") or "").upper()
+        is_refreshable   = m.get("is_refreshable", True)
+
+        if storage_mode_raw == "ABF":
+            print(f"  [SKIP] '{model_name}' — Direct Lake model (no M expressions)")
+            skipped += 1
+            continue
+
+        if not is_refreshable:
+            print(f"  [SKIP] '{model_name}' — not refreshable (likely auto-generated default model)")
+            skipped += 1
+            continue
+
         # ── Step A: get table ID → name map ───────────────────────────────────
-        table_rows = _execute_dax(
-            ws_id, model_id,
-            "EVALUATE INFO.TABLES()",
-            model_name
-        )
+        table_rows = _execute_dax(ws_id, model_id, _DAX_TABLES, model_name)
         if table_rows is None:
             skipped += 1
-            continue   # Access error already logged
+            continue   # Error already logged + printed
 
         table_id_to_name: Dict[int, str] = {
             int(t.get("TableID", -1)): t.get("Name", "")
@@ -1125,30 +1271,24 @@ def extract_power_queries(model_rows: List[Dict]) -> List[Dict]:
         }
 
         # ── Step B: get partitions with query expressions ──────────────────────
-        partition_rows = _execute_dax(
-            ws_id, model_id,
-            "EVALUATE INFO.PARTITIONS()",
-            model_name
-        )
+        partition_rows = _execute_dax(ws_id, model_id, _DAX_PARTS, model_name)
         if partition_rows is None:
             skipped += 1
             continue
 
         for p in (partition_rows or []):
-            raw_type    = p.get("Type")
-            raw_mode    = p.get("Mode")
-            table_id    = int(p.get("TableID", -1))
-            table_name  = table_id_to_name.get(table_id, f"TableID_{table_id}")
-            query_expr  = p.get("QueryDefinition") or ""
+            raw_type   = p.get("Type")
+            raw_mode   = p.get("Mode")
+            table_id   = int(p.get("TableID", -1))
+            table_name = table_id_to_name.get(table_id, f"TableID_{table_id}")
+            query_expr = p.get("QueryDefinition") or ""
+            part_name  = p.get("Name", "")
 
-            # Skip hidden system / internal partitions that have no query
-            # (e.g. Date table auto-generated partitions) unless they have an expression
-            part_name = p.get("Name", "")
             if not part_name:
-                continue
+                continue   # Skip unnamed system partitions
 
             partition_type = _PARTITION_TYPE_MAP.get(raw_type, "Unknown")
-            storage_mode   = _STORAGE_MODE_MAP.get(raw_mode, "Unknown")
+            storage_mode   = _STORAGE_MODE_MAP.get(raw_mode,   "Unknown")
 
             rows.append({
                 "query_id":         str(uuid.uuid4()),
@@ -1158,9 +1298,9 @@ def extract_power_queries(model_rows: List[Dict]) -> List[Dict]:
                 "table_id":         table_id,
                 "table_name":       table_name,
                 "partition_name":   part_name,
-                "partition_type":   partition_type,    # M / SQL / DAX / Historical / Unknown
-                "storage_mode":     storage_mode,      # Import / DirectQuery / etc.
-                "query_expression": query_expr,        # The actual M or SQL text
+                "partition_type":   partition_type,
+                "storage_mode":     storage_mode,
+                "query_expression": query_expr,
                 "extracted_at":     extraction_ts
             })
 
